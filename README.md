@@ -16,3 +16,5 @@ Before adding implementation, define:
 ## Security
 
 Do not commit bot tokens, webhook URLs, cookies, session files, or exported private messages.
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the decision gate and recommended first milestone.
