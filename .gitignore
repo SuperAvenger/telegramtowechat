@@ -1,0 +1,12 @@
+.env
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+*.session
+*.sqlite
+exports/
+.forwarder-state.json
+.forwarder-state.json.tmp
