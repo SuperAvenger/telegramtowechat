@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import aiohttp
 from telethon import TelegramClient, events
@@ -19,6 +21,8 @@ from telethon import TelegramClient, events
 
 LOG = logging.getLogger("telegramtowechat")
 WECOM_TEXT_LIMIT = 1900
+WECOM_IMAGE_LIMIT = 2 * 1024 * 1024
+WECOM_FILE_LIMIT = 20 * 1024 * 1024
 SECRET_RE = re.compile(r"(key=)[^&\s]+", re.IGNORECASE)
 
 
@@ -83,6 +87,28 @@ def media_label(message: object) -> str:
     return ""
 
 
+def image_payload(data: bytes) -> dict:
+    if not data or len(data) > WECOM_IMAGE_LIMIT:
+        raise ValueError("企业微信图片必须大于 0 且不超过 2MB")
+    return {
+        "msgtype": "image",
+        "image": {
+            "base64": base64.b64encode(data).decode("ascii"),
+            "md5": hashlib.md5(data).hexdigest(),  # noqa: S324 - required by WeCom API
+        },
+    }
+
+
+def wecom_upload_url(webhook_url: str) -> str:
+    parsed = urlparse(webhook_url)
+    key = parse_qs(parsed.query).get("key", [""])[0]
+    if parsed.scheme != "https" or parsed.hostname != "qyapi.weixin.qq.com" or not key:
+        raise ValueError("WECOM_WEBHOOK_URL 不是有效的企业微信群机器人地址")
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, "/cgi-bin/webhook/upload_media", "", urlencode({"key": key, "type": "file"}), "")
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     api_id: int
@@ -93,6 +119,8 @@ class Settings:
     dry_run: bool
     dedupe_state_file: str
     dedupe_limit: int
+    forward_media: bool
+    max_media_bytes: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,6 +142,11 @@ class Settings:
             dry_run=os.getenv("DRY_RUN", "0").lower() in {"1", "true", "yes"},
             dedupe_state_file=os.getenv("DEDUPE_STATE_FILE", ".forwarder-state.json").strip(),
             dedupe_limit=max(100, int(os.getenv("DEDUPE_LIMIT", "10000"))),
+            forward_media=os.getenv("FORWARD_MEDIA", "1").lower() in {"1", "true", "yes"},
+            max_media_bytes=min(
+                WECOM_FILE_LIMIT,
+                max(1, int(os.getenv("MAX_MEDIA_BYTES", str(WECOM_FILE_LIMIT)))),
+            ),
         )
 
 
@@ -185,8 +218,35 @@ class WeComSender:
         if self.dry_run:
             LOG.info("DRY_RUN: %s", text)
             return
-        assert self.session is not None
         payload = {"msgtype": "text", "text": {"content": text}}
+        await self._post_payload(payload)
+
+    async def send_image(self, data: bytes) -> None:
+        if self.dry_run:
+            LOG.info("DRY_RUN: image bytes=%s", len(data))
+            return
+        await self._post_payload(image_payload(data))
+
+    async def send_file(self, data: bytes, filename: str) -> None:
+        if not data or len(data) > WECOM_FILE_LIMIT:
+            raise ValueError("企业微信文件必须大于 0 且不超过 20MB")
+        if self.dry_run:
+            LOG.info("DRY_RUN: file name=%s bytes=%s", filename, len(data))
+            return
+        assert self.session is not None
+        form = aiohttp.FormData()
+        form.add_field("media", data, filename=filename, content_type="application/octet-stream")
+        async with self.session.post(wecom_upload_url(self.webhook_url), data=form) as response:
+            result = await response.json(content_type=None)
+            media_id = result.get("media_id")
+            if response.status != 200 or result.get("errcode") != 0 or not media_id:
+                raise RuntimeError(
+                    f"企业微信文件上传失败: HTTP {response.status}, errcode={result.get('errcode')}"
+                )
+        await self._post_payload({"msgtype": "file", "file": {"media_id": media_id}})
+
+    async def _post_payload(self, payload: dict) -> None:
+        assert self.session is not None
         for attempt in range(4):
             try:
                 async with self.session.post(self.webhook_url, json=payload) as response:
@@ -199,6 +259,25 @@ class WeComSender:
             if attempt == 3:
                 raise RuntimeError(f"企业微信推送失败: {error}")
             await asyncio.sleep(0.5 * (2**attempt))
+
+
+async def forward_media(message: object, sender: WeComSender, max_bytes: int) -> str:
+    """Download one Telegram attachment and deliver it through the WeCom robot."""
+    file_info = getattr(message, "file", None)
+    declared_size = int(getattr(file_info, "size", 0) or 0)
+    if declared_size > max_bytes:
+        raise ValueError(f"媒体超过大小限制 ({declared_size} > {max_bytes})")
+    data = await message.download_media(file=bytes)
+    if not isinstance(data, bytes) or not data:
+        raise ValueError("Telegram 媒体下载为空")
+    if len(data) > max_bytes:
+        raise ValueError(f"媒体超过大小限制 ({len(data)} > {max_bytes})")
+    if getattr(message, "photo", None):
+        await sender.send_image(data)
+        return "图片已转发"
+    filename = getattr(file_info, "name", None) or f"telegram-{getattr(message, 'id', 'media')}.bin"
+    await sender.send_file(data, filename)
+    return f"文件已转发：{filename}"
 
 
 def message_url(username: str | None, message_id: int) -> str:
@@ -222,6 +301,17 @@ async def run(settings: Settings) -> None:
             title = getattr(chat, "title", None) or getattr(chat, "username", None) or chat_id
             body = (message.raw_text or "").strip()
             media = media_label(message)
+            if settings.forward_media and getattr(message, "media", None):
+                try:
+                    media = f"{media} {await forward_media(message, sender, settings.max_media_bytes)}".strip()
+                except Exception as exc:
+                    LOG.warning(
+                        "媒体转发失败 channel=%s message_id=%s: %s",
+                        chat_id,
+                        message.id,
+                        SECRET_RE.sub(r"\1***", str(exc)),
+                    )
+                    media = f"{media}（媒体转发失败，保留原消息链接）"
             content = "\n".join(part for part in (media, body) if part) or "[空消息]"
             url = message_url(getattr(chat, "username", None), message.id)
             output = f"【Telegram · {title}】\n{content}"
